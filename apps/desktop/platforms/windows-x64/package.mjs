@@ -1,5 +1,5 @@
 import { packager } from '@electron/packager';
-import { access, rm } from 'node:fs/promises';
+import { access, cp, rm } from 'node:fs/promises';
 import { execFileSync } from 'node:child_process';
 import path from 'node:path';
 import { systemTar } from '../../src/platform.mjs';
@@ -32,6 +32,12 @@ export default async function packageWindows(target) {
       OriginalFilename: 'Open DeepTutor.exe', 'requested-execution-level': 'asInvoker',
     },
   });
+
+  // The agent CLI launchers ship next to the app executable so both the
+  // installer (File /r ${SOURCE}\*) and the portable zip carry them.
+  await cp(path.join(target.folder, 'cli'), path.join(built, 'cli'), { recursive: true });
+  await cp(path.join(target.folder, 'cli', 'deeptutor.cmd'), path.join(built, 'deeptutor.cmd'));
+  await cp(path.join(target.folder, 'cli', 'deeptutor-ensure.ps1'), path.join(built, 'deeptutor-ensure.ps1'));
 
   const stem = `${target.artifact}-v${version}`;
   const portable = path.join(out, `${stem}-Portable.zip`);

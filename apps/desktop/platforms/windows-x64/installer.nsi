@@ -60,6 +60,9 @@ VIAddVersionKey "FileVersion" "${FILEVERSION}"
   Delete "$INSTDIR\LICENSE"
   Delete "$INSTDIR\LICENSES.chromium.html"
   Delete "$INSTDIR\version"
+  Delete "$INSTDIR\deeptutor.cmd"
+  Delete "$INSTDIR\deeptutor-ensure.ps1"
+  RMDir /r "$INSTDIR\cli"
 !macroend
 
 Section
