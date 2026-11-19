@@ -4,9 +4,10 @@
 $ErrorActionPreference = 'Stop'
 # cli/ sits one level below the other platform scripts: ../../.. is apps/desktop.
 $desktop = (Resolve-Path "$PSScriptRoot/../../..").Path
-$appRoot = Get-ChildItem "$desktop/.local/windows-x64" -Directory -Filter 'app-win32-*' |
+# @electron/packager writes the app to out/<name>-win32-<arch>.
+$appRoot = Get-ChildItem "$desktop/out" -Directory -Filter '*-win32-x64' |
     Sort-Object LastWriteTime -Descending | Select-Object -First 1
-if (!$appRoot) { throw 'Expected the packaged app folder (app-win32-x64) from npm run package' }
+if (!$appRoot) { throw "Expected the packaged app folder (*-win32-x64) under $desktop\out from npm run package" }
 $cmd = Join-Path $appRoot.FullName 'deeptutor.cmd'
 if (!(Test-Path $cmd)) { throw "deeptutor.cmd is missing from the packaged app: $cmd" }
 
