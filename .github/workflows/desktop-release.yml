@@ -1,38 +1,19 @@
 name: Desktop Release
 
-# Builds Open DeepTutor for Windows from feat-1.7.3 and attaches the downloads
-# to a GitHub Release when publishing. Personal fork edition: macOS targets are
-# removed; push-triggered validation runs stay on feat-1.7.3 only. The build
-# lives in apps/desktop/platforms/windows-x64/.
-#
-# Pull requests that touch apps/desktop build and smoke-test all three without
-# publishing; they keep the downloads as workflow artifacts for 7 days.
-# Pushes to dev and manual validation runs exercise configured signing without
-# publishing. Pull requests always use disposable runtime signing keys.
+# Builds Open DeepTutor for Windows from feat-1.7.3. Personal fork edition:
+# manual-trigger only — no push, PR or release event starts a build; run it
+# from the Actions page (Run workflow → feat-1.7.3). macOS targets are removed.
+# The build lives in apps/desktop/platforms/windows-x64/.
 #
 # Secrets:
-#   DESKTOP_RUNTIME_SIGNING_KEY  (required for releases) Ed25519 PEM matching
+#   DESKTOP_RUNTIME_SIGNING_KEY  (required for a stable signing identity)
+#                                Ed25519 PEM matching
 #                                apps/desktop/assets/runtime-public.pem.
-#                                Pull requests always seal with a throwaway key.
-#   APPLE_CERTIFICATE_P12, APPLE_CERTIFICATE_PASSWORD, APPLE_SIGNING_IDENTITY,
-#   APPLE_ID, APPLE_TEAM_ID, APPLE_APP_PASSWORD
-#                                (optional) Developer ID signing and
-#                                notarization. Without them the Mac apps are
-#                                signed ad hoc and Gatekeeper warns on first open.
+#                                Without it the workflow seals with a throwaway
+#                                key (--new-key) whose identity changes every run.
 #   The Windows build is unsigned; SmartScreen warns on first open.
 
 on:
-  push:
-    branches: [feat-1.7.3]
-    paths:
-      - apps/desktop/**
-      - .github/workflows/desktop-release.yml
-  release:
-    types: [published]
-  pull_request:
-    paths:
-      - apps/desktop/**
-      - .github/workflows/desktop-release.yml
   workflow_dispatch:
     inputs:
       tag:
@@ -45,15 +26,15 @@ on:
         default: false
 
 env:
-  RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
-  PUBLISH: ${{ github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
+  RELEASE_TAG: ${{ inputs.tag }}
+  PUBLISH: ${{ github.event_name == 'workflow_dispatch' && inputs.publish }}
 
 permissions:
   contents: write
 
 concurrency:
-  group: desktop-release-${{ inputs.tag || github.event.release.tag_name || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: desktop-release-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
@@ -68,9 +49,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 120
     env:
-      HAS_DEVELOPER_ID: ${{ secrets.APPLE_CERTIFICATE_P12 != '' }}
-      HAS_NOTARY: ${{ secrets.APPLE_ID != '' }}
-      HAS_RUNTIME_KEY: ${{ github.event_name != 'pull_request' && secrets.DESKTOP_RUNTIME_SIGNING_KEY != '' }}
+      HAS_RUNTIME_KEY: ${{ secrets.DESKTOP_RUNTIME_SIGNING_KEY != '' }}
     defaults:
       run:
         shell: bash
@@ -92,23 +71,9 @@ jobs:
           fi
 
       - name: Verify signing configuration
-        if: github.event_name != 'pull_request'
-        env:
-          HAS_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD != '' }}
-          HAS_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY != '' }}
-          HAS_TEAM_ID: ${{ secrets.APPLE_TEAM_ID != '' }}
-          HAS_NOTARY_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD != '' }}
         run: |
           set -euo pipefail
           [ "$HAS_RUNTIME_KEY" = "true" ] || { echo "DESKTOP_RUNTIME_SIGNING_KEY is required for signed validation and releases." >&2; exit 1; }
-          if [ "$RUNNER_OS" = "macOS" ]; then
-            if [ "$HAS_DEVELOPER_ID" = "true" ] || [ "$HAS_SIGNING_IDENTITY" = "true" ] || [ "$HAS_CERTIFICATE_PASSWORD" = "true" ]; then
-              [ "$HAS_DEVELOPER_ID" = "true" ] && [ "$HAS_SIGNING_IDENTITY" = "true" ] && [ "$HAS_CERTIFICATE_PASSWORD" = "true" ] || { echo "Developer ID signing configuration is incomplete." >&2; exit 1; }
-            fi
-            if [ "$HAS_NOTARY" = "true" ] || [ "$HAS_NOTARY_PASSWORD" = "true" ]; then
-              [ "$HAS_DEVELOPER_ID" = "true" ] && [ "$HAS_NOTARY" = "true" ] && [ "$HAS_TEAM_ID" = "true" ] && [ "$HAS_NOTARY_PASSWORD" = "true" ] || { echo "Apple notarization configuration is incomplete." >&2; exit 1; }
-            fi
-          fi
 
       - uses: actions/setup-node@v4
         with:
@@ -127,29 +92,9 @@ jobs:
       - name: Check and test the shell
         run: npm ci && npm run check && npm test
 
-      - name: Import the Developer ID certificate
-        if: runner.os == 'macOS' && env.HAS_DEVELOPER_ID == 'true' && github.event_name != 'pull_request'
-        env:
-          APPLE_CERTIFICATE_P12: ${{ secrets.APPLE_CERTIFICATE_P12 }}
-          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-        run: |
-          set -euo pipefail
-          keychain="$RUNNER_TEMP/signing.keychain-db"
-          password="$(uuidgen)"
-          umask 077
-          echo "$APPLE_CERTIFICATE_P12" | base64 --decode > "$RUNNER_TEMP/certificate.p12"
-          security create-keychain -p "$password" "$keychain"
-          security set-keychain-settings -lut 21600 "$keychain"
-          security unlock-keychain -p "$password" "$keychain"
-          security import "$RUNNER_TEMP/certificate.p12" -P "$APPLE_CERTIFICATE_PASSWORD" -A -t cert -f pkcs12 -k "$keychain"
-          security set-key-partition-list -S apple-tool:,apple: -k "$password" "$keychain"
-          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
-          rm "$RUNNER_TEMP/certificate.p12"
-
       - name: Build the bundled runtime
         env:
-          OPEN_DEEPTUTOR_SIGNING_KEY: ${{ github.event_name != 'pull_request' && secrets.DESKTOP_RUNTIME_SIGNING_KEY || '' }}
-          APPLE_SIGNING_IDENTITY: ${{ github.event_name != 'pull_request' && secrets.APPLE_SIGNING_IDENTITY || '' }}
+          OPEN_DEEPTUTOR_SIGNING_KEY: ${{ secrets.DESKTOP_RUNTIME_SIGNING_KEY }}
         run: |
           set -euo pipefail
           if [ "$HAS_RUNTIME_KEY" = "true" ]; then
@@ -165,8 +110,6 @@ jobs:
         run: npm run smoke -- --target ${{ matrix.target }}
 
       - name: Package
-        env:
-          APPLE_SIGNING_IDENTITY: ${{ github.event_name != 'pull_request' && secrets.APPLE_SIGNING_IDENTITY || '' }}
         run: npm run package -- --target ${{ matrix.target }}
 
       - name: Verify Windows installation and app lifecycle
@@ -174,34 +117,17 @@ jobs:
         shell: pwsh
         run: ./platforms/windows-x64/smoke-installer.ps1
 
-      - name: Notarize the DMG
-        if: runner.os == 'macOS' && env.HAS_NOTARY == 'true' && github.event_name != 'pull_request'
-        env:
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
-        run: node scripts/notarize.mjs
-
-      - name: Keep the Apple notarization reports
-        if: always() && runner.os == 'macOS' && env.HAS_NOTARY == 'true' && github.event_name != 'pull_request'
-        uses: actions/upload-artifact@v4
-        with:
-          name: notarization-${{ matrix.target }}
-          retention-days: 7
-          path: apps/desktop/out/notarization-*.json
-
       - name: Attach the downloads to the release
         if: env.PUBLISH == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          # Each platform produces only its own downloads.
           shopt -s nullglob
-          files=(out/*.dmg out/*-Setup.exe out/*-Portable.zip)
+          files=(out/*-Setup.exe out/*-Portable.zip)
           [ ${#files[@]} -gt 0 ] || { echo "No downloads were produced." >&2; exit 1; }
-          # Also attach copies without the version in the name, so the README
-          # can link to releases/latest/download/<name> and always get the newest build.
+          # Also attach copies without the version in the name, so links can
+          # point at releases/latest/download/<name> for the newest build.
           mkdir -p out/latest
           for f in "${files[@]}"; do
             name="$(basename "$f")"
@@ -211,14 +137,6 @@ jobs:
           done
           gh release upload "$RELEASE_TAG" "${files[@]}" out/latest/* --clobber
 
-      - name: Remove the temporary signing keychain
-        if: always() && runner.os == 'macOS' && env.HAS_DEVELOPER_ID == 'true' && github.event_name != 'pull_request'
-        run: |
-          rm -f "$RUNNER_TEMP/certificate.p12"
-          if [ -f "$RUNNER_TEMP/signing.keychain-db" ]; then
-            security delete-keychain "$RUNNER_TEMP/signing.keychain-db"
-          fi
-
       - name: Keep the validation build
         if: always() && env.PUBLISH != 'true'
         uses: actions/upload-artifact@v4
@@ -226,7 +144,6 @@ jobs:
           name: ${{ matrix.target }}
           retention-days: 7
           path: |
-            apps/desktop/out/*.dmg
             apps/desktop/out/*-Setup.exe
             apps/desktop/out/*-Portable.zip
             apps/desktop/.local/${{ matrix.target }}/smoke.log
@@ -236,7 +153,7 @@ jobs:
   verify-release:
     name: Verify all desktop downloads are published
     needs: build
-    if: always() && (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.publish))
+    if: always() && github.event_name == 'workflow_dispatch' && inputs.publish
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -259,8 +176,6 @@ jobs:
               ...context.repo, release_id: release.id, per_page: 100,
             });
             const versioned = [
-              `Open-DeepTutor-MacOS-Apple-Silicon-${tag}.dmg`,
-              `Open-DeepTutor-MacOS-Intel-${tag}.dmg`,
               `Open-DeepTutor-Windows-${tag}-Setup.exe`,
               `Open-DeepTutor-Windows-${tag}-Portable.zip`,
             ];
