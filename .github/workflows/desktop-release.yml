@@ -1,9 +1,9 @@
 name: Desktop Release
 
-# Builds Open DeepTutor for MacOS (Apple Silicon and Intel) and Windows from
-# the release tag and attaches the downloads to the same GitHub Release that
-# pypi-release.yml publishes. Each platform's build lives in
-# apps/desktop/platforms/<target>/.
+# Builds Open DeepTutor for Windows from feat-1.7.3 and attaches the downloads
+# to a GitHub Release when publishing. Personal fork edition: macOS targets are
+# removed; push-triggered validation runs stay on feat-1.7.3 only. The build
+# lives in apps/desktop/platforms/windows-x64/.
 #
 # Pull requests that touch apps/desktop build and smoke-test all three without
 # publishing; they keep the downloads as workflow artifacts for 7 days.
@@ -23,7 +23,7 @@ name: Desktop Release
 
 on:
   push:
-    branches: [dev]
+    branches: [feat-1.7.3]
     paths:
       - apps/desktop/**
       - .github/workflows/desktop-release.yml
@@ -62,12 +62,6 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - target: macos-arm64
-            name: Open DeepTutor for MacOS with Apple Silicon
-            runner: macos-15
-          - target: macos-x64
-            name: Open DeepTutor for MacOS with Intel Silicon
-            runner: macos-15-intel
           - target: windows-x64
             name: Open DeepTutor for Windows
             runner: windows-2025
