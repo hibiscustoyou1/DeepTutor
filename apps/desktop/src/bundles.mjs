@@ -49,11 +49,17 @@ export function newerRuntime(candidate, current) {
  * Decide what boot() starts from the saved runtime, the bundled seed and the last
  * upgrade transaction. Without a saved runtime the seed is installed as before.
  * An unusable seed never blocks the saved runtime, and a seed whose first start
- * already failed is not tried again.
+ * already failed is not tried again. A saved runtime the app cannot trust — for
+ * example one sealed under a signing key a newer build replaced — is reported
+ * instead of thrown, so boot() can fall back to the bundled seed.
  */
 export function startupRuntime({ saved, seed, transaction, publicKey }) {
   if (!saved) return {};
-  const current = verifyManifest(saved, publicKey);
+  let current;
+  let savedError;
+  try { current = verifyManifest(saved, publicKey); }
+  catch (error) { savedError = error; }
+  if (!current) return { savedError };
   let bundled = null;
   let seedError;
   if (seed) {

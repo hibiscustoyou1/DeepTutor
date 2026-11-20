@@ -71,7 +71,20 @@ test('boot keeps the saved core unless the app ships a newer signed one that has
   assert.equal(startupRuntime({ saved, seed, transaction: failed, publicKey }).upgrade, false);
   const interrupted = { phase: 'recovered', previous: saved, candidate: seed };
   assert.equal(startupRuntime({ saved, seed, transaction: interrupted, publicKey }).upgrade, true);
-  assert.throws(() => startupRuntime({ saved: { ...saved, runtimeId: '../outside' }, seed, publicKey }));
+  // A malformed or distrusted saved manifest is reported, never thrown: the app
+  // falls back to the bundled seed instead of refusing to start.
+  const distrusted = startupRuntime({ saved: { ...saved, runtimeId: '../outside' }, seed, publicKey });
+  assert.equal(distrusted.current, undefined);
+  assert.match(distrusted.savedError.message, /compatible/);
+  // A saved runtime sealed under a replaced signing key must not kill boot():
+  // the app falls back to its bundled seed like a first start.
+  const rotated = generateKeyPairSync('ed25519');
+  const oldKeySaved = { ...saved };
+  oldKeySaved.signature = sign(null, Buffer.from(canonicalManifest({ ...saved, signature: undefined })), rotated.privateKey).toString('base64');
+  const abandoned = startupRuntime({ saved: oldKeySaved, seed, transaction: interrupted, publicKey });
+  assert.equal(abandoned.current, undefined);
+  assert.equal(abandoned.upgrade, undefined);
+  assert.match(abandoned.savedError.message, /signature|compatible/);
 });
 
 test('occupied ports are left alone and an available port is chosen', async t => {

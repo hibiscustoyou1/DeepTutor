@@ -228,10 +228,15 @@ async function startupManifest() {
   if (!saved) return { manifestFile: seed };
   // A missing or unreadable seed must not stop the installed core from starting.
   const bundled = await readJSON(seed).catch(error => { console.error(error); return null; });
-  const { current, upgrade, seedError } = startupRuntime({
+  const { current, upgrade, seedError, savedError } = startupRuntime({
     saved, seed: bundled, transaction: await readJSON(transactionFile), publicKey,
   });
   if (seedError) console.error(seedError);
+  if (savedError) console.error(savedError);
+  // A saved runtime this build cannot trust — e.g. one sealed under a signing
+  // key the app replaced — falls back to the bundled seed, like a first start.
+  // The workspace is untouched; the new core simply takes over the next start.
+  if (!current) return { manifestFile: seed };
   const installed = path.join(userRoot, 'runtimes', current.runtimeId, 'installed.json');
   return upgrade ? { manifestFile: seed, previous: current, installed } : { manifestFile: installed };
 }

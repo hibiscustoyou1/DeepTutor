@@ -6,9 +6,16 @@
 # Prints the runtime root on success. Throws on failure.
 $ErrorActionPreference = 'Stop'
 
-# $PSScriptRoot = the app install root; the seed ships as an extraResource.
-$seed = Join-Path $PSScriptRoot 'resources\seed'
-$manifestFile = Join-Path $seed 'runtime.json'
+# The launchers sit either in the app root or in its cli\ subfolder (package.mjs
+# copies them to both). $seedRoot walks up to whichever holds the seed.
+$seedRoot = $PSScriptRoot
+while ($seedRoot -and !(Test-Path (Join-Path $seedRoot 'resources\seed'))) {
+    $parent = Split-Path $seedRoot -Parent
+    if ($parent -eq $seedRoot) { $seedRoot = $null; break }
+    $seedRoot = $parent
+}
+if (!$seedRoot) { throw "No resources\seed folder above $PSScriptRoot; is this inside the installed app?" }
+$manifestFile = Join-Path $seedRoot 'resources\seed\runtime.json'
 if (!(Test-Path $manifestFile)) { throw "No bundled runtime manifest at $manifestFile" }
 $manifest = Get-Content $manifestFile -Raw | ConvertFrom-Json
 if (!$manifest.runtimeId) { throw 'The bundled runtime manifest is invalid' }
@@ -24,7 +31,7 @@ if (Test-Path $python) {
 }
 
 # Fresh install: verify the archive checksum like installBundle() does.
-$archive = Join-Path $seed $manifest.archive
+$archive = Join-Path $seedRoot "resources\seed\$($manifest.archive)"
 if (!(Test-Path $archive)) { throw "Bundled runtime archive is missing: $archive" }
 $actual = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
 if ($actual -ne $manifest.sha256) {

@@ -56,5 +56,10 @@ try {
 } finally {
     $env:PATH = $oldPath
     $env:OPEN_DEEPTUTOR_TEST_HOME = $oldHome
-    if (Test-Path $root) { Remove-Item $root -Recurse -Force }
+    # The extracted runtime contains site-package paths beyond MAX_PATH; the
+    # \\?\ prefix lets PowerShell 5.1 delete them. Cleanup is best-effort:
+    # a temp folder left behind must not fail an otherwise passing run.
+    try { Remove-Item -LiteralPath "\\?\$root" -Recurse -Force -ErrorAction Stop }
+    catch { Write-Warning "Could not clean up temp folder $root : $_" }
+    # $log already archives the transcript in place via Tee-Object.
 }
