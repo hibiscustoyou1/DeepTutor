@@ -1,0 +1,95 @@
+name: Ctcloud Desktop Build
+
+# Fork-only workflow (the upstream desktop-release.yml stays untouched and its
+# builds keep the in-repo placeholders). Builds the bundled desktop app with
+# the ctcloud channel credentials baked in via scripts/build-with-secrets.mjs
+# and uploads the downloads as workflow artifacts. Nothing is published.
+#
+# Required repository secrets:
+#   CTCLOUD_APP_CODE, CTCLOUD_APP_SECRET   ctcloud channel credentials (YL-3rd-Appcode / sk)
+#   DESKTOP_RUNTIME_SIGNING_KEY             optional — Ed25519 PEM matching
+#                                           assets/runtime-public.pem; without it the
+#                                           build falls back to a throwaway key (--new-key).
+# Apple Developer ID signing and notarization are skipped here; without them the
+# Mac apps are signed ad hoc and Gatekeeper warns on first open (same as upstream).
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ctcloud-desktop-build-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: macos-arm64
+            name: Open DeepTutor for MacOS with Apple Silicon (ctcloud build)
+            runner: macos-15
+          - target: macos-x64
+            name: Open DeepTutor for MacOS with Intel Silicon (ctcloud build)
+            runner: macos-15-intel
+          - target: windows-x64
+            name: Open DeepTutor for Windows (ctcloud build)
+            runner: windows-2025
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    env:
+      HAS_RUNTIME_KEY: ${{ secrets.DESKTOP_RUNTIME_SIGNING_KEY != '' }}
+    defaults:
+      run:
+        shell: bash
+        working-directory: apps/desktop
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            apps/desktop/package-lock.json
+            web/package-lock.json
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Install the Windows installer toolchain
+        if: runner.os == 'Windows'
+        run: choco install nsis --yes --no-progress
+
+      - name: Check and test the shell
+        run: npm ci && npm run check && npm test
+
+      - name: Build with injected ctcloud credentials
+        env:
+          CTCLOUD_APP_CODE: ${{ secrets.CTCLOUD_APP_CODE }}
+          CTCLOUD_APP_SECRET: ${{ secrets.CTCLOUD_APP_SECRET }}
+          OPEN_DEEPTUTOR_SIGNING_KEY: ${{ secrets.DESKTOP_RUNTIME_SIGNING_KEY }}
+        run: |
+          set -euo pipefail
+          if [ "$HAS_RUNTIME_KEY" = "true" ]; then
+            node scripts/build-with-secrets.mjs --target ${{ matrix.target }}
+          else
+            node scripts/build-with-secrets.mjs --target ${{ matrix.target }} --new-key
+          fi
+
+      - name: Keep the downloads
+        uses: actions/upload-artifact@v4
+        with:
+          name: ctcloud-${{ matrix.target }}
+          retention-days: 7
+          if-no-files-found: error
+          path: |
+            apps/desktop/out/*.dmg
+            apps/desktop/out/*-Setup.exe
+            apps/desktop/out/*-Portable.zip
+            apps/desktop/.local/${{ matrix.target }}/smoke.log
+            apps/desktop/.local/${{ matrix.target }}/smoke-result.json
