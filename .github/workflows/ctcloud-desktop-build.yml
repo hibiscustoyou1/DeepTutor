@@ -2,8 +2,14 @@ name: Ctcloud Desktop Build
 
 # Fork-only workflow (the upstream desktop-release.yml stays untouched and its
 # builds keep the in-repo placeholders). Builds the bundled desktop app with
-# the ctcloud channel credentials baked in via scripts/build-with-secrets.mjs
-# and uploads the downloads as workflow artifacts. Nothing is published.
+# the ctcloud channel credentials baked in via scripts/build-with-secrets.mjs.
+#
+# Two modes:
+#   - Publish: attach the downloads to the GitHub Release for the given tag
+#     (triggered by a `release: published` event or a manual run with
+#     publish=true). Requires contents: write so gh release upload can run.
+#   - Validate: keep the downloads as workflow artifacts for 7 days (manual run
+#     with publish=false, or a failed/partial publish).
 #
 # Required repository secrets:
 #   CTCLOUD_APP_CODE, CTCLOUD_APP_SECRET   ctcloud channel credentials (YL-3rd-Appcode / sk)
@@ -14,13 +20,28 @@ name: Ctcloud Desktop Build
 # Mac apps are signed ad hoc and Gatekeeper warns on first open (same as upstream).
 
 on:
+  release:
+    types: [published]
   workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to attach the downloads to (required when publishing)
+        required: false
+        type: string
+      publish:
+        description: Attach downloads to the existing release instead of only validating
+        type: boolean
+        default: false
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
+  PUBLISH: ${{ github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.publish) }}
 
 permissions:
-  contents: read
+  contents: write
 
 concurrency:
-  group: ctcloud-desktop-build-${{ github.ref }}
+  group: ctcloud-desktop-build-${{ inputs.tag || github.event.release.tag_name || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -44,6 +65,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PUBLISH == 'true' && env.RELEASE_TAG || '' }}
 
       - uses: actions/setup-node@v4
         with:
@@ -75,7 +98,29 @@ jobs:
             node scripts/build-with-secrets.mjs --target ${{ matrix.target }} --new-key
           fi
 
-      - name: Keep the downloads
+      - name: Attach the downloads to the release
+        if: env.PUBLISH == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Each platform produces only its own downloads.
+          shopt -s nullglob
+          files=(out/*.dmg out/*-Setup.exe out/*-Portable.zip)
+          [ ${#files[@]} -gt 0 ] || { echo "No downloads were produced." >&2; exit 1; }
+          # Also attach copies without the version in the name, so the README
+          # can link to releases/latest/download/<name> and always get the newest build.
+          mkdir -p out/latest
+          for f in "${files[@]}"; do
+            name="$(basename "$f")"
+            stable="${name/-$RELEASE_TAG/}"
+            [ "$stable" != "$name" ] || { echo "Expected $RELEASE_TAG in $name." >&2; exit 1; }
+            cp "$f" "out/latest/$stable"
+          done
+          gh release upload "$RELEASE_TAG" "${files[@]}" out/latest/* --clobber
+
+      - name: Keep the validation build
+        if: always() && env.PUBLISH != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ctcloud-${{ matrix.target }}
