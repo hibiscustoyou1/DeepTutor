@@ -116,36 +116,28 @@ class CtcloudGrpcError(CtcloudError):
 # 开发者注：CtcloudConfig 必须是 BaseModel —— WebUI 表单由
 # GET /api/partners/channels/schema 从本模型自动渲染（约定模块内存在
 # ``XxxConfig`` BaseModel）。类 docstring 会成为表单顶部描述（面向用户，
-# 只写一句话）；sk 字段名含 "secret" 以命中密钥遮蔽。
+# 只写一句话）。
 
-# 内置实现性常量（表单预置默认值，用户可覆盖；jssdk 网关等纯实现参数仍硬编码）
+# 接入参数硬编码（与 AGENT_TYPE 同类，均为用户决策）：不做表单/配置项。
+# 真实凭据不落源码仓库 —— Desktop 打包时由构建脚本
+# （apps/desktop/scripts/build-runtime.mjs）按环境变量生成
+# _ctcloud_secrets.py 注入 bundled core；源码/开发环境回落占位符。
 DEFAULT_API_BASE_URL = "https://openyilian.ctyun.cn"
 DEFAULT_GRPC_SERVER_ADDRESS = "clawyilian.ctyun.cn:2000"
+ALLOW_FROM = ("*",)  # 允许对话的用户 open_id 白名单；"*" 允许全部
+
+try:
+    from deeptutor.partners.channels import _ctcloud_secrets
+    AGENT_APP_CODE = _ctcloud_secrets.AGENT_APP_CODE
+    AGENT_APP_SECRET = _ctcloud_secrets.AGENT_APP_SECRET
+except ImportError:  # 源码 checkout / 未注入构建：占位符
+    AGENT_APP_CODE = "ak"  # 应用标识（YL-3rd-Appcode）占位符
+    AGENT_APP_SECRET = "sk"  # 签名密钥占位符
 
 class CtcloudConfig(Base):
-    """接入天翼云电脑：填写平台分配的应用标识与密钥，以及允许使用的用户白名单。"""
+    """接入天翼云电脑：启用即用，接入参数已内置。"""
 
     enabled: bool = Field(default=False, description="启用天翼云电脑渠道。")
-    api_base_url: str = Field(
-        default=DEFAULT_API_BASE_URL,
-        description="平台地址，一般保持默认；测试环境由对接人提供。",
-    )
-    grpc_address: str = Field(
-        default="",
-        description="gRPC 网关地址，留空自动按平台地址推导。",
-    )
-    agent_app_code: str = Field(
-        default="",
-        description="应用标识（YL-3rd-Appcode），联系天翼对接人获取。",
-    )
-    agent_app_secret: str = Field(
-        default="",
-        description="签名密钥（sk），与应用标识配套，联系天翼对接人获取。",
-    )
-    allow_from: list[str] = Field(
-        default_factory=list,
-        description="允许对话的用户 open_id 白名单，每行一个；填 * 允许全部。",
-    )
 
     @classmethod
     def default_config(cls) -> dict[str, Any]:
@@ -706,22 +698,13 @@ class CtcloudChannel(BaseChannel):
         self._loop: asyncio.AbstractEventLoop | None = None
         self._tunnel: "_TlsTunnel | None" = None
 
-    # ── 地址解析（环境判定必须用解析后的 baseUrl）─────────────────
-
-    def _resolve_api_base_url(self) -> str:
-        # 配置留空 → 内置生产地址；测试/其它环境由用户在表单覆盖
-        return self.config.api_base_url.strip() or DEFAULT_API_BASE_URL
-
-    def _resolve_grpc_address(self) -> str:
-        explicit = self.config.grpc_address.strip()
-        if explicit:
-            return explicit
-        base = self._resolve_api_base_url()
-        # 环境判定用解析后的 baseUrl：生产 → 固定网关；其它 → 从 portal 派生
-        host = base.removeprefix("https://").removeprefix("http://").rstrip("/")
-        if host == "openyilian.ctyun.cn":
-            return DEFAULT_GRPC_SERVER_ADDRESS
-        return host
+    def is_allowed(self, sender_id: str) -> bool:
+        """白名单硬编码（原为配置字段，现与 AGENT_TYPE 同类常量）。"""
+        if not ALLOW_FROM:
+            return False
+        if "*" in ALLOW_FROM:
+            return True
+        return str(sender_id) in ALLOW_FROM
 
     def _state_path(self):
         return self.state_dir() / "credentials.json"
@@ -771,13 +754,13 @@ class CtcloudChannel(BaseChannel):
         外层每轮从 getAuthStr 重走：上轮失败多半因 authStr/registerToken
         作废、ticket 已被消费，只有重走才能拿到全新一批凭据。
         """
-        base = self._resolve_api_base_url()
-        app_code = self.config.agent_app_code
-        sk = self.config.agent_app_secret
+        base = DEFAULT_API_BASE_URL
+        app_code = AGENT_APP_CODE
+        sk = AGENT_APP_SECRET
         if not app_code or not sk:
             raise CtcloudProvisioningError(
                 "config-incomplete",
-                "缺少 YL-3rd-Appcode 或 sk 配置，无法发起注册",
+                "AGENT_APP_CODE / AGENT_APP_SECRET 常量为空，无法发起注册",
                 retryable=False,
             )
 
@@ -908,8 +891,8 @@ class CtcloudChannel(BaseChannel):
         if not self.config.enabled:
             self.set_setup_state("action_required", message="渠道未启用（enabled=false）。")
             return
-        if not self.config.allow_from:
-            logger.warning("ctcloud: allow_from is empty — all access denied")
+        if not ALLOW_FROM:
+            logger.warning("ctcloud: ALLOW_FROM is empty — all access denied")
 
         self._running = True
         self._loop = asyncio.get_running_loop()
@@ -1009,7 +992,7 @@ class CtcloudChannel(BaseChannel):
             plain = f.read()
         data = aes_encrypt(plain, key.encode("utf-8"))
         http = self._get_http()
-        base = self._resolve_api_base_url().replace("openyilian", "filesvryilian")
+        base = DEFAULT_API_BASE_URL.replace("openyilian", "filesvryilian")
         files = {"file": (os.path.basename(file_path), data)}
         resp = await http.post(
             f"{base}/plugins/fileserver/agent/chat",
@@ -1147,7 +1130,7 @@ class CtcloudChannel(BaseChannel):
 
     async def _connect_grpc(self) -> None:
         pb2, pb2_grpc = self._load_stub()
-        address = self._resolve_grpc_address()
+        address = DEFAULT_GRPC_SERVER_ADDRESS
         # 网关是 TLS 服务（自签 CA）且**不回 ALPN**：grpc C-core 的
         # grpc_ssl_check_alpn 在握手后强制要求 ALPN=h2，服务端不选协议就报
         # "Cannot check peer: missing selected ALPN property"（该检查只受
