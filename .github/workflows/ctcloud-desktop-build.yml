@@ -16,6 +16,9 @@ name: Ctcloud Desktop Build
 #   DESKTOP_RUNTIME_SIGNING_KEY             optional — Ed25519 PEM matching
 #                                           assets/runtime-public.pem; without it the
 #                                           build falls back to a throwaway key (--new-key).
+# ctmeta.exe is NOT bundled: on Windows the ctcloud channel reads it from the
+# cloud-desktop client's fixed install path (see ctcloud.py), which a real
+# cloud desktop always has.
 # Apple Developer ID signing and notarization are skipped here; without them the
 # Mac apps are signed ad hoc and Gatekeeper warns on first open (same as upstream).
 

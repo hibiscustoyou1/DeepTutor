@@ -16,6 +16,8 @@ import re
 import ssl
 import string
 import struct
+import subprocess
+import sys
 import time
 import uuid
 from collections import OrderedDict
@@ -208,18 +210,16 @@ def build_provision_headers(
     }
 
 
-# Linux 云桌面身份文件：seed 即桌面 uuid（与参考实装 BGZS_LINUX_DATASOURCE_PATH 一致）
+# 云桌面身份来源（参考实装 bgzs-desktop-meta.mjs，双平台）：
+#   Linux  ：datasource 文件中的 seed=... 即桌面 uuid（不走 ctmeta）。
+#   Windows：执行云桌面客户端（clink）自带的 ctmeta.exe，输出 JSON {uuid, name}。
+#            不随包分发 —— 真实云电脑环境固定存在该文件。
 LINUX_DATASOURCE_PATH = "/var/lib/cloud/instance/datasource"
+WINDOWS_CLINK_CTMETA_PATH = r"C:\Program Files (x86)\ctyun\clink\64\ctmeta.exe"
+CTMETA_PATH_ENV = "DEEPTUTOR_CTCLOUD_CTMETA_PATH"
 
 
-def read_desktop_uuid() -> str:
-    """读云桌面 uuid，供 YL-Desktop-Uuid 使用。
-
-    参考实装逻辑：Linux 取 datasource 中的 seed=...（不走 ctmeta）。
-    RBAC 按桌面 uuid 绑定机器人与桌面/账号；读不到该头时服务端直接
-    PERMISSION_DENIED（RBAC: access denied）——因此这里读不到时抛错，
-    而不是静默不发。
-    """
+def _read_desktop_uuid_linux() -> str:
     try:
         content = Path(LINUX_DATASOURCE_PATH).read_text("utf-8")
     except OSError as e:
@@ -237,6 +237,68 @@ def read_desktop_uuid() -> str:
             retryable=False,
         )
     return m.group(1)
+
+
+def _read_desktop_uuid_windows() -> str:
+    exe = os.environ.get(CTMETA_PATH_ENV, "").strip() or WINDOWS_CLINK_CTMETA_PATH
+    if not Path(exe).is_file():
+        raise CtcloudProvisioningError(
+            "desktop-unavailable",
+            f"未找到 ctmeta.exe（{WINDOWS_CLINK_CTMETA_PATH}）。"
+            f"该文件由云桌面客户端（clink）自带，非云桌面环境无法接入；"
+            f"如路径有变化可设置 {CTMETA_PATH_ENV} 指向其绝对路径。",
+            retryable=False,
+        )
+    try:
+        proc = subprocess.run(
+            [exe],
+            capture_output=True,
+            timeout=10,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        raise CtcloudProvisioningError(
+            "desktop-unavailable",
+            f"ctmeta.exe 执行失败（{exe}: {type(e).__name__}）。",
+            retryable=False,
+        ) from e
+    if proc.returncode != 0:
+        detail = proc.stderr.decode("utf-8", "replace").strip()[:200] or "-"
+        raise CtcloudProvisioningError(
+            "desktop-unavailable",
+            f"ctmeta.exe 退出码 {proc.returncode}（{exe}）：{detail}",
+            retryable=False,
+        )
+    try:
+        meta = json.loads(proc.stdout.decode("utf-8", "replace"))
+    except ValueError as e:
+        raise CtcloudProvisioningError(
+            "desktop-unavailable",
+            f"ctmeta.exe 输出不是 JSON（{exe}）：{proc.stdout[:200]!r}",
+            retryable=False,
+        ) from e
+    desktop_uuid = str(meta.get("uuid") or "").strip() if isinstance(meta, dict) else ""
+    if not desktop_uuid:
+        raise CtcloudProvisioningError(
+            "desktop-unavailable",
+            f"ctmeta.exe 输出中无 uuid（{exe}）。",
+            retryable=False,
+        )
+    return desktop_uuid
+
+
+def read_desktop_uuid() -> str:
+    """读云桌面 uuid，供 YL-Desktop-Uuid 使用。
+
+    平台分发（参考实装逻辑）：Linux 取 datasource 中的 seed=...；Windows
+    执行 ctmeta.exe 取其 JSON 输出中的 uuid。
+    RBAC 按桌面 uuid 绑定机器人与桌面/账号；读不到该头时服务端直接
+    PERMISSION_DENIED（RBAC: access denied）——因此这里读不到时抛错，
+    而不是静默不发。
+    """
+    if sys.platform == "win32":
+        return _read_desktop_uuid_windows()
+    return _read_desktop_uuid_linux()
 
 
 def build_grpc_metadata(
@@ -1345,7 +1407,10 @@ class CtcloudChannel(BaseChannel):
             enabled=self.config.enabled,
             grpc_available=CTCLOUD_AVAILABLE,
             allow_from_count=len(ALLOW_FROM),
-            datasource=LINUX_DATASOURCE_PATH,
+            identity=(
+                WINDOWS_CLINK_CTMETA_PATH if sys.platform == "win32"
+                else LINUX_DATASOURCE_PATH
+            ),
         )
         try:
             await self._start_once(conn, started)
@@ -1392,8 +1457,8 @@ class CtcloudChannel(BaseChannel):
         self._running = True
         self._loop = asyncio.get_running_loop()
 
-        # RBAC 按桌面 uuid 绑定：容器/非云桌面环境读不到时直接进入终态，
-        # 不让 gRPC 带着缺失的身份头反复撞 PERMISSION_DENIED。
+        # RBAC 按桌面 uuid 绑定：Linux 缺 datasource / Windows 缺 ctmeta.exe
+        # 时直接进入终态，不让 gRPC 带着缺失的身份头反复撞 PERMISSION_DENIED。
         try:
             self._desktop_uuid = read_desktop_uuid()
         except CtcloudError as e:

@@ -20,6 +20,10 @@ import { loadCredentials } from './lib/ctcloud-credentials.mjs';
 // repo-root .env (see inject-ctcloud-secrets.mjs). The runtime signing key
 // follows the upstream convention: OPEN_DEEPTUTOR_SIGNING_KEY, or the
 // existing .local/signing-private.pem, or --new-key for a throwaway identity.
+//
+// ctmeta.exe is NOT bundled: the ctcloud channel on Windows reads it from the
+// cloud-desktop client's fixed install path (see ctcloud.py), so a real cloud
+// desktop always has it.
 
 const flag = process.argv.indexOf('--target');
 const targetArg = flag >= 0 ? process.argv[flag + 1] : undefined;
