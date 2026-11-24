@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 import random as _random
+import re
 import ssl
 import string
 import struct
@@ -21,6 +22,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import httpx
 from loguru import logger
@@ -92,9 +94,17 @@ class CtcloudError(Exception):
 
 
 class CtcloudHttpError(CtcloudError):
-    def __init__(self, code: str, message: str, status: int | None = None):
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        status: int | None = None,
+        retryable: bool = False,
+    ):
         super().__init__(code, message)
         self.status = status
+        # 与现状保持一致：HTTP 失败默认不进入外层重试（直接终止本轮编排）。
+        self.retryable = retryable
 
 
 class CtcloudProvisioningError(CtcloudError):
@@ -210,8 +220,6 @@ def read_desktop_uuid() -> str:
     PERMISSION_DENIED（RBAC: access denied）——因此这里读不到时抛错，
     而不是静默不发。
     """
-    import re
-
     try:
         content = Path(LINUX_DATASOURCE_PATH).read_text("utf-8")
     except OSError as e:
@@ -287,6 +295,144 @@ def _jwt_exp(token: str) -> str:
 def _credential_fingerprint(secret: str) -> str:
     """凭据脱敏指纹：长度 + md5 前 8 位。给后端核对 signKey 用，不泄值。"""
     return f"len={len(secret)} md5={hashlib.md5(secret.encode('utf-8')).hexdigest()[:8]}"
+
+
+# ── 建联日志（conn_id 关联 + 阶段事件 + 脱敏）────────────────────
+#
+# 目标：runtime.log 默认 INFO 级别即可看到完整建联链路。字段全部放在
+# 消息内（loguru 的 bind() 额外字段在 bridge 处会丢失），统一格式：
+#   ctcloud[conn=…] stage=… event=… k=v …
+# 凭据只记长度/指纹；URL 去 query；响应体截断并打码敏感键。
+
+_SECRET_KEY_RE = re.compile(
+    r"(?i)(token|secret|password|passwd|authorization|signature|sign_?key|"
+    r"api_?key|ticket|auth_?str|register_?token)"
+)
+_SECRET_PAIR_RE = re.compile(
+    r'(?i)("?(?:token|secret|password|passwd|authorization|signature|'
+    r'sign_?key|api_?key|ticket|auth_?str|register_?token)"?\s*[:=]\s*)'
+    r'("?)([^",}\s]+)'
+)
+_SAFE_FIELD_SUFFIXES = ("_len", "_fp", "_exp", "_count", "_present", "_keys", "_id")
+
+
+def _new_conn_id() -> str:
+    """一次建联尝试的短关联 ID（不参与签名，仅用于日志串联）。"""
+    return "c" + uuid.uuid4().hex[:8]
+
+
+def _elapsed_ms(started: float) -> int:
+    return int((time.monotonic() - started) * 1000)
+
+
+def _is_secret_field(key: str) -> bool:
+    name = str(key).lower().replace("-", "_")
+    if name.endswith(_SAFE_FIELD_SUFFIXES):
+        return False
+    return bool(_SECRET_KEY_RE.search(name))
+
+
+def _fmt_value(value: Any) -> str:
+    text = " ".join(str(value).split())
+    return text if len(text) <= 300 else text[:297] + "..."
+
+
+def _log_stage(
+    conn: str, stage: str, event: str, *, level: str = "INFO", **fields: Any
+) -> None:
+    """统一建联日志出口：字段脱敏 + 单行 key=value。"""
+    rendered: list[str] = []
+    for key, value in fields.items():
+        if value is None:
+            continue
+        rendered.append(f"{key}={'***' if _is_secret_field(key) else _fmt_value(value)}")
+    suffix = (" " + " ".join(rendered)) if rendered else ""
+    logger.log(
+        level, "ctcloud[conn={}] stage={} event={}{}", conn, stage, event, suffix
+    )
+
+
+def _safe_url(url: str) -> str:
+    """只保留 scheme/host/path，丢掉可能携带签名的 query/fragment。"""
+    try:
+        parts = urlsplit(str(url))
+        return f"{parts.scheme}://{parts.netloc}{parts.path}"
+    except Exception:
+        return "<unparsable-url>"
+
+
+def _redact_obj(value: Any, depth: int = 0) -> Any:
+    if depth > 5:
+        return "..."
+    if isinstance(value, dict):
+        return {
+            str(k): ("***" if _is_secret_field(str(k)) else _redact_obj(v, depth + 1))
+            for k, v in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_obj(v, depth + 1) for v in list(value)[:20]]
+    return value
+
+
+def _body_snippet(resp: Any, limit: int = 512) -> str:
+    """失败响应体的可排查片段：JSON 按敏感键打码，非 JSON 正则兜底，截断。"""
+    try:
+        text = resp.text or ""
+    except Exception:
+        return "<no-body>"
+    try:
+        text = json.dumps(
+            _redact_obj(json.loads(text)), ensure_ascii=False, default=str
+        )
+    except Exception:
+        text = _SECRET_PAIR_RE.sub(lambda m: f"{m.group(1)}{m.group(2)}***", text)
+    text = " ".join(text.split())
+    return (text[:limit] + "...") if len(text) > limit else (text or "<empty>")
+
+
+def _normalize_http_error(exc: Exception, *, stage: str) -> CtcloudError:
+    """把 httpx 异常归一化为带 code 的渠道错误。
+
+    retryable=False 与现状保持一致：当前 HTTP/网络失败会直接终止本轮
+    注册编排（不会被外层重试吸收），这里只补上结构化归类与日志。
+    """
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        return CtcloudHttpError(
+            f"http-{status}",
+            f"{stage} HTTP {status}: {_body_snippet(exc.response)}",
+            status=status,
+            retryable=False,
+        )
+    if isinstance(exc, httpx.TimeoutException):
+        return CtcloudProvisioningError(
+            "network-timeout",
+            f"{stage} 请求超时（{type(exc).__name__}）",
+            retryable=False,
+        )
+    if isinstance(exc, httpx.RequestError):
+        return CtcloudProvisioningError(
+            f"network-{type(exc).__name__.lower()}",
+            f"{stage} 网络错误（{type(exc).__name__}）",
+            retryable=False,
+        )
+    return CtcloudProvisioningError(
+        "unexpected", f"{stage} 未预期异常（{type(exc).__name__}）", retryable=False
+    )
+
+
+def _grpc_error_field(exc: Any, name: str) -> str:
+    attr = getattr(exc, name, None)
+    try:
+        value = attr() if callable(attr) else attr
+    except Exception:
+        value = None
+    return str(value or "")[:300]
+
+
+def _grpc_error_code(exc: Any) -> str:
+    return _grpc_error_field(exc, "code")
+
 
 # ── yimu 媒体容器加解密（AES-128-CBC，64KiB 分片，零 IV）─────────
 #
@@ -492,6 +638,7 @@ async def request_ticket_via_jssdk(
     api_key: str,
     *,
     logger_: Any = logger,
+    conn: str | None = None,
 ) -> str:
     """连接 ws://127.0.0.1:9002，methodName 4 取 ticket（新流程 type:0 票据）。
 
@@ -505,13 +652,28 @@ async def request_ticket_via_jssdk(
        新流程要求 type:0 票据；methodName 3 的票据 register 能过、gRPC
        connect 却报 13 INTERNAL（实装踩坑）。
     """
+    conn_id = conn or "-"
+    ws_parts = urlsplit(JSSDK_WS_ENDPOINT)
+    ws_host = ws_parts.hostname or ""
+    ws_port = ws_parts.port or 0
+    started = time.monotonic()
     try:
         import websockets
     except ImportError as e:
+        _log_stage(
+            conn_id, "jssdk_ticket", "fail", level="WARNING",
+            code="ws-unavailable", retryable=False, exc=type(e).__name__,
+        )
         raise CtcloudProvisioningError(
             "ws-unavailable", "websockets 库未安装，无法连接云电脑客户端取票", retryable=False
         ) from e
 
+    _log_stage(
+        conn_id, "jssdk_ticket", "ws_connect",
+        ws_host=ws_host, ws_port=ws_port,
+        api_key_fp=_credential_fingerprint(api_key),
+        auth_str_len=len(auth_str),
+    )
     try:
         t = int(time.time() * 1000)
         secret = _jssdk_derive_key(JSSDK_SECRET_B64)
@@ -525,6 +687,11 @@ async def request_ticket_via_jssdk(
         x_key = _jssdk_derive_key(JSSDK_XKEY_B64)
 
         async with websockets.connect(url, open_timeout=5) as ws:
+            _log_stage(
+                conn_id, "jssdk_ticket", "ws_connected",
+                ws_host=ws_host, ws_port=ws_port,
+                elapsed_ms=_elapsed_ms(started),
+            )
             request = {
                 "methodName": 4,  # authRequestWithTicketNew（新流程票据）
                 "apiKey": api_key,
@@ -535,23 +702,42 @@ async def request_ticket_via_jssdk(
             raw = await asyncio.wait_for(ws.recv(), timeout=9)
             response = json.loads(_xxtea_decrypt_from_hex(str(raw), x_key))
 
+            keys = ",".join(response.keys()) if isinstance(response, dict) else "?"
+            code = response.get("code") if isinstance(response, dict) else None
+            _log_stage(
+                conn_id, "jssdk_ticket", "response",
+                code=code, keys=keys, elapsed_ms=_elapsed_ms(started),
+            )
+
             ticket = response.get("ticket") or ""
             if not ticket:
                 # 只记短字段与字段名清单，绝不打印整个响应（ticket 是凭据）
-                keys = ",".join(response.keys()) if isinstance(response, dict) else "?"
-                code = response.get("code") if isinstance(response, dict) else None
                 logger_.warning(
                     "ctcloud jssdk ticket response carried no ticket (code={}, keys={})",
                     code, keys,
                 )
+                _log_stage(
+                    conn_id, "jssdk_ticket", "fail", level="WARNING",
+                    code="jssdk-no-ticket", response_code=code, keys=keys,
+                    elapsed_ms=_elapsed_ms(started),
+                )
                 raise CtcloudProvisioningError(
                     "jssdk-no-ticket", "云电脑客户端未返回 ticket"
                 )
+            _log_stage(
+                conn_id, "jssdk_ticket", "ticket",
+                ticket_len=len(ticket), elapsed_ms=_elapsed_ms(started),
+            )
             return ticket
     except CtcloudProvisioningError:
         raise
     except (asyncio.TimeoutError, OSError, Exception) as e:
         # 连接层失败：客户端多半还没就绪（渠道加载时自动发起，用户可能之后才打开）
+        _log_stage(
+            conn_id, "jssdk_ticket", "fail", level="WARNING",
+            code="jssdk-failed", exc=type(e).__name__,
+            elapsed_ms=_elapsed_ms(started),
+        )
         raise CtcloudProvisioningError(
             "jssdk-failed", f"云电脑客户端取票失败: {type(e).__name__}"
         ) from e
@@ -593,26 +779,60 @@ class _TlsTunnel:
     按 accept 循环逐条转发，每条 client socket 独立对接一条远端 TLS 连接。
     """
 
-    def __init__(self, target_host: str, target_port: int, ca_file: Path | None):
+    def __init__(
+        self,
+        target_host: str,
+        target_port: int,
+        ca_file: Path | None,
+        *,
+        conn: str = "-",
+        log_level: str = "INFO",
+    ):
         self._target_host = target_host
         self._target_port = target_port
         self._ca_file = ca_file
         self._server: asyncio.AbstractServer | None = None
         self._tasks: set[asyncio.Task[None]] = set()
         self.local_port: int = 0
+        self._conn = conn
+        self._log_level = log_level
+        self._handshakes = 0
 
     @classmethod
-    async def start(cls, target: str, ca_file: Path | None) -> "_TlsTunnel":
+    async def start(
+        cls,
+        target: str,
+        ca_file: Path | None,
+        *,
+        conn: str = "-",
+        log_level: str = "INFO",
+    ) -> "_TlsTunnel":
         host, _, port = target.rpartition(":")
-        tunnel = cls(host or target, int(port or 443), ca_file)
+        tunnel = cls(
+            host or target, int(port or 443), ca_file, conn=conn, log_level=log_level
+        )
+        started = time.monotonic()
         tunnel._server = await asyncio.start_server(
             tunnel._handle_client, "127.0.0.1", 0
         )
         tunnel.local_port = tunnel._server.sockets[0].getsockname()[1]
-        logger.info("ctcloud TLS tunnel listening on 127.0.0.1:{}", tunnel.local_port)
+        _log_stage(
+            conn, "transport.tunnel", "ok", level=log_level,
+            target=f"{tunnel._target_host}:{tunnel._target_port}",
+            local_port=tunnel.local_port,
+            ca=("present" if ca_file else "none"),
+            elapsed_ms=_elapsed_ms(started),
+        )
+        if log_level == "INFO":
+            logger.info("ctcloud TLS tunnel listening on 127.0.0.1:{}", tunnel.local_port)
         return tunnel
 
     async def stop(self) -> None:
+        pending = len(self._tasks)
+        _log_stage(
+            self._conn, "transport.tunnel", "stopping", level=self._log_level,
+            local_port=self.local_port, pending_connections=pending,
+        )
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
@@ -622,7 +842,8 @@ class _TlsTunnel:
         if self._tasks:
             await asyncio.gather(*self._tasks, return_exceptions=True)
         self._tasks.clear()
-        logger.info("ctcloud TLS tunnel stopped")
+        if self._log_level == "INFO":
+            logger.info("ctcloud TLS tunnel stopped")
 
     async def _handle_client(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         task = asyncio.current_task()
@@ -640,6 +861,17 @@ class _TlsTunnel:
                 self._target_host, self._target_port, ssl=ssl_ctx,
                 server_hostname=self._target_host,
             )
+            self._handshakes += 1
+            # gRPC 可能为每个 RPC 新开 subchannel：逐条打会淹没日志，
+            # 前 3 条 + 之后每 10 条保留一条 INFO 作为连通性证据。
+            if self._handshakes <= 3 or self._handshakes % 10 == 0:
+                _log_stage(
+                    self._conn, "transport.tunnel", "handshake_ok",
+                    level=self._log_level,
+                    target=f"{self._target_host}:{self._target_port}",
+                    local_port=self.local_port,
+                    count=self._handshakes,
+                )
             async def pipe(src: asyncio.StreamReader, dst_writer: asyncio.StreamWriter) -> None:
                 try:
                     while True:
@@ -662,6 +894,11 @@ class _TlsTunnel:
                 return_exceptions=True,
             )
         except (OSError, ssl.SSLError) as e:
+            _log_stage(
+                self._conn, "transport.tunnel", "handshake_fail", level="WARNING",
+                target=f"{self._target_host}:{self._target_port}",
+                exc=type(e).__name__, detail=str(e)[:200],
+            )
             logger.warning("ctcloud TLS tunnel connection failed: {}", e)
         finally:
             writer.close()
@@ -697,6 +934,7 @@ class CtcloudChannel(BaseChannel):
         self._http: httpx.AsyncClient | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._tunnel: "_TlsTunnel | None" = None
+        self._conn_id: str = "-"
 
     def is_allowed(self, sender_id: str) -> bool:
         """白名单硬编码（原为配置字段，现与 AGENT_TYPE 同类常量）。"""
@@ -718,9 +956,10 @@ class CtcloudChannel(BaseChannel):
 
     # ── 凭证装载与注册编排 ────────────────────────────────────────
 
-    def _load_credentials(self) -> _Credentials | None:
+    def _load_credentials(self, conn: str = "-") -> _Credentials | None:
         path = self._state_path()
         if not path.is_file():
+            _log_stage(conn, "credentials", "load", source="none", path=str(path))
             return None
         try:
             data = json.loads(path.read_text("utf-8"))
@@ -730,8 +969,26 @@ class CtcloudChannel(BaseChannel):
                 yl_authorization=str(data.get("ylAuthorization") or ""),
             )
             if creds.claw_bot_account_id and creds.sign_key and creds.yl_authorization:
+                _log_stage(
+                    conn, "credentials", "load", source="cache",
+                    account_id=creds.claw_bot_account_id,
+                    sk_fp=_credential_fingerprint(creds.sign_key),
+                    auth_exp=_jwt_exp(creds.yl_authorization),
+                    path=str(path),
+                )
                 return creds
+            _log_stage(
+                conn, "credentials", "fail", level="WARNING",
+                code="incomplete", path=str(path),
+                account_id_present=bool(creds.claw_bot_account_id),
+                sign_key_present=bool(creds.sign_key),
+                authorization_present=bool(creds.yl_authorization),
+            )
         except (json.JSONDecodeError, OSError) as e:
+            _log_stage(
+                conn, "credentials", "fail", level="WARNING",
+                code="unreadable", exc=type(e).__name__, path=str(path),
+            )
             logger.warning("ctcloud credentials file unreadable: {}", e)
         return None
 
@@ -748,7 +1005,7 @@ class CtcloudChannel(BaseChannel):
         )
         logger.info("ctcloud credentials saved to {}", path)
 
-    async def _provision(self) -> _Credentials:
+    async def _provision(self, conn: str) -> _Credentials:
         """三步注册编排，两层重试共用一条 90s 时限。
 
         外层每轮从 getAuthStr 重走：上轮失败多半因 authStr/registerToken
@@ -758,6 +1015,10 @@ class CtcloudChannel(BaseChannel):
         app_code = AGENT_APP_CODE
         sk = AGENT_APP_SECRET
         if not app_code or not sk:
+            _log_stage(
+                conn, "provision", "fail", level="WARNING",
+                code="config-incomplete", retryable=False,
+            )
             raise CtcloudProvisioningError(
                 "config-incomplete",
                 "AGENT_APP_CODE / AGENT_APP_SECRET 常量为空，无法发起注册",
@@ -765,79 +1026,225 @@ class CtcloudChannel(BaseChannel):
             )
 
         deadline = time.monotonic() + PROVISION_DEADLINE_S
+        started = time.monotonic()
         last_error: CtcloudError | None = None
+        _log_stage(
+            conn, "provision", "start",
+            base=_safe_url(base),
+            agent_type=AGENT_TYPE,
+            deadline_s=PROVISION_DEADLINE_S,
+            appcode_fp=_credential_fingerprint(app_code),
+            phases=len(_PHASE_RETRY_DELAYS),
+        )
 
         for phase_attempt, phase_delay in enumerate(_PHASE_RETRY_DELAYS):
             if phase_delay:
+                _log_stage(
+                    conn, "provision", "retry", level="WARNING",
+                    attempt=phase_attempt + 1, retry_in_s=phase_delay,
+                )
                 await asyncio.sleep(phase_delay)
             if time.monotonic() > deadline:
+                _log_stage(
+                    conn, "provision", "deadline", level="WARNING",
+                    attempt=phase_attempt + 1, elapsed_ms=_elapsed_ms(started),
+                )
                 break
+            _log_stage(
+                conn, "provision", "phase_start",
+                attempt=phase_attempt + 1, total=len(_PHASE_RETRY_DELAYS),
+            )
             try:
-                return await self._provision_once(base, app_code, sk, deadline)
+                creds = await self._provision_once(conn, base, app_code, sk, deadline)
+                _log_stage(
+                    conn, "provision", "ok", attempt=phase_attempt + 1,
+                    elapsed_ms=_elapsed_ms(started),
+                )
+                return creds
             except CtcloudProvisioningError as e:
                 if not e.retryable:
+                    _log_stage(
+                        conn, "provision", "fail", level="WARNING",
+                        attempt=phase_attempt + 1, code=e.code,
+                        retryable=False, elapsed_ms=_elapsed_ms(started),
+                    )
                     raise
                 last_error = e
-                logger.warning(
-                    "ctcloud provision phase {} failed: {} (code={})",
-                    phase_attempt + 1, e, e.code,
+                _log_stage(
+                    conn, "provision", "phase_fail", level="WARNING",
+                    attempt=phase_attempt + 1, code=e.code,
+                    retryable=True, elapsed_ms=_elapsed_ms(started),
                 )
+            except CtcloudHttpError as e:
+                last_error = e
+                _log_stage(
+                    conn, "provision", "phase_fail", level="WARNING",
+                    attempt=phase_attempt + 1, code=e.code, status=e.status,
+                    retryable=e.retryable, elapsed_ms=_elapsed_ms(started),
+                )
+                if not e.retryable:
+                    raise
             except CtcloudError as e:
                 last_error = e
-                logger.warning("ctcloud provision phase {} failed: {}", phase_attempt + 1, e)
+                _log_stage(
+                    conn, "provision", "phase_fail", level="WARNING",
+                    attempt=phase_attempt + 1, code=getattr(e, "code", "unexpected"),
+                    elapsed_ms=_elapsed_ms(started),
+                )
 
+        _log_stage(
+            conn, "provision", "fail", level="WARNING",
+            code="provision-exhausted", attempts=len(_PHASE_RETRY_DELAYS),
+            elapsed_ms=_elapsed_ms(started),
+        )
         raise CtcloudProvisioningError(
             "provision-exhausted",
             f"注册编排重试耗尽（{PHASE_MAX_RETRIES + 1} 轮）：{last_error}",
         )
 
     async def _provision_once(
-        self, base: str, app_code: str, sk: str, deadline: float
+        self, conn: str, base: str, app_code: str, sk: str, deadline: float
     ) -> _Credentials:
         # 步骤 1：getAuthStr
         params = {"agentType": AGENT_TYPE}
         headers = build_provision_headers(params, app_code, sk)
         http = self._get_http()
-        resp = await http.get(
-            f"{base}{ENDPOINT_GET_AUTH_STR}",
-            params=params,
-            headers=headers,
+        started = time.monotonic()
+        _log_stage(
+            conn, "get_auth_str", "start",
+            endpoint=ENDPOINT_GET_AUTH_STR, agent_type=AGENT_TYPE,
         )
+        try:
+            resp = await http.get(
+                f"{base}{ENDPOINT_GET_AUTH_STR}",
+                params=params,
+                headers=headers,
+            )
+        except httpx.HTTPError as e:
+            err = _normalize_http_error(e, stage="get_auth_str")
+            _log_stage(
+                conn, "get_auth_str", "fail", level="WARNING",
+                code=getattr(err, "code", "unexpected"),
+                retryable=getattr(err, "retryable", False),
+                elapsed_ms=_elapsed_ms(started), exc=type(e).__name__,
+            )
+            raise err from e
+
         if resp.status_code == 401:
+            _log_stage(
+                conn, "get_auth_str", "fail", level="WARNING",
+                code="signature-rejected", status=401, retryable=False,
+                elapsed_ms=_elapsed_ms(started),
+                body_snippet=_body_snippet(resp),
+            )
             raise CtcloudProvisioningError(
                 "signature-rejected", "YL-Signature 校验失败（401）：核对串序与系统时钟",
                 retryable=False,
             )
         if resp.status_code == 403:
+            _log_stage(
+                conn, "get_auth_str", "fail", level="WARNING",
+                code="authorization-rejected", status=403, retryable=False,
+                elapsed_ms=_elapsed_ms(started),
+                body_snippet=_body_snippet(resp),
+            )
             raise CtcloudProvisioningError(
                 "authorization-rejected", "YL-3rd-Appcode 校验失败（403）",
                 retryable=False,
             )
-        resp.raise_for_status()
-        data = resp.json().get("data") or {}
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            err = _normalize_http_error(e, stage="get_auth_str")
+            _log_stage(
+                conn, "get_auth_str", "fail", level="WARNING",
+                code=err.code, status=getattr(err, "status", None),
+                retryable=getattr(err, "retryable", False),
+                elapsed_ms=_elapsed_ms(started),
+                body_snippet=_body_snippet(resp),
+            )
+            raise err from e
+
+        try:
+            data = resp.json().get("data") or {}
+        except (json.JSONDecodeError, ValueError) as e:
+            _log_stage(
+                conn, "get_auth_str", "fail", level="WARNING",
+                code="response-invalid-json", status=resp.status_code,
+                retryable=False, elapsed_ms=_elapsed_ms(started),
+                body_snippet=_body_snippet(resp),
+            )
+            raise CtcloudProvisioningError(
+                "response-invalid-json", "getAuthStr 响应不是合法 JSON", retryable=False
+            ) from e
         auth_str = str(data.get("authStr") or "")
         register_token = str(data.get("registerToken") or "")
         if not auth_str or not register_token:
+            _log_stage(
+                conn, "get_auth_str", "fail", level="WARNING",
+                code="getauthstr-incomplete", status=resp.status_code,
+                elapsed_ms=_elapsed_ms(started),
+                auth_str_len=len(auth_str), register_token_len=len(register_token),
+            )
             raise CtcloudProvisioningError(
                 "getauthstr-incomplete", "getAuthStr 响应缺少 authStr/registerToken"
             )
-        logger.info(
-            "ctcloud getAuthStr ok (authStr len={}, registerToken len={})",
-            len(auth_str), len(register_token),
+        _log_stage(
+            conn, "get_auth_str", "ok", status=resp.status_code,
+            elapsed_ms=_elapsed_ms(started),
+            auth_str_len=len(auth_str), register_token_len=len(register_token),
         )
 
         # 步骤 2：jssdk 取票（内层重试：每次尝试新建 ws 连接）
-        ticket = await self._request_ticket_with_retry(auth_str, deadline)
+        ticket = await self._request_ticket_with_retry(conn, auth_str, deadline)
 
         # 步骤 3：register
         headers = build_provision_headers({}, app_code, sk)
-        resp = await http.post(
-            f"{base}{ENDPOINT_REGISTER}",
-            json={"ticket": ticket, "agentType": AGENT_TYPE, "registerToken": register_token},
-            headers=headers,
+        started = time.monotonic()
+        _log_stage(
+            conn, "register", "start",
+            endpoint=ENDPOINT_REGISTER, ticket_len=len(ticket),
         )
-        resp.raise_for_status()
-        result = resp.json()
+        try:
+            resp = await http.post(
+                f"{base}{ENDPOINT_REGISTER}",
+                json={"ticket": ticket, "agentType": AGENT_TYPE, "registerToken": register_token},
+                headers=headers,
+            )
+        except httpx.HTTPError as e:
+            err = _normalize_http_error(e, stage="register")
+            _log_stage(
+                conn, "register", "fail", level="WARNING",
+                code=getattr(err, "code", "unexpected"),
+                retryable=getattr(err, "retryable", False),
+                elapsed_ms=_elapsed_ms(started), exc=type(e).__name__,
+            )
+            raise err from e
+        try:
+            resp.raise_for_status()
+        except httpx.HTTPStatusError as e:
+            err = _normalize_http_error(e, stage="register")
+            _log_stage(
+                conn, "register", "fail", level="WARNING",
+                code=err.code, status=getattr(err, "status", None),
+                retryable=getattr(err, "retryable", False),
+                elapsed_ms=_elapsed_ms(started),
+                body_snippet=_body_snippet(resp),
+            )
+            raise err from e
+
+        try:
+            result = resp.json()
+        except (json.JSONDecodeError, ValueError) as e:
+            _log_stage(
+                conn, "register", "fail", level="WARNING",
+                code="response-invalid-json", status=resp.status_code,
+                retryable=False, elapsed_ms=_elapsed_ms(started),
+                body_snippet=_body_snippet(resp),
+            )
+            raise CtcloudProvisioningError(
+                "response-invalid-json", "register 响应不是合法 JSON", retryable=False
+            ) from e
         data = result.get("data") or {}
         creds = _Credentials(
             claw_bot_account_id=str(data.get("clawBotAccountId") or ""),
@@ -845,35 +1252,83 @@ class CtcloudChannel(BaseChannel):
             yl_authorization=str(data.get("ylAuthorization") or ""),
         )
         if not (creds.claw_bot_account_id and creds.sign_key and creds.yl_authorization):
+            _log_stage(
+                conn, "register", "fail", level="WARNING",
+                code="register-incomplete", status=resp.status_code,
+                result_code=result.get("resultCode"),
+                result_msg=str(result.get("resultMsg") or "")[:200],
+                elapsed_ms=_elapsed_ms(started),
+                body_snippet=_body_snippet(resp),
+            )
             raise CtcloudProvisioningError(
                 "register-incomplete",
                 f"register 响应缺少三要素之一（resultCode={result.get('resultCode')}, "
                 f"resultMsg={result.get('resultMsg')}）",
             )
-        logger.info(
-            "ctcloud register ok: claw_bot_account_id={} sign_key={} auth_exp={}",
-            creds.claw_bot_account_id,
-            _credential_fingerprint(creds.sign_key),
-            _jwt_exp(creds.yl_authorization),
+        _log_stage(
+            conn, "register", "ok", status=resp.status_code,
+            elapsed_ms=_elapsed_ms(started),
+            account_id=creds.claw_bot_account_id,
+            sk_fp=_credential_fingerprint(creds.sign_key),
+            auth_exp=_jwt_exp(creds.yl_authorization),
         )
         return creds
 
-    async def _request_ticket_with_retry(self, auth_str: str, deadline: float) -> str:
+    async def _request_ticket_with_retry(
+        self, conn: str, auth_str: str, deadline: float
+    ) -> str:
         last_error: CtcloudError | None = None
+        started = time.monotonic()
+        _log_stage(
+            conn, "jssdk_ticket", "retry_loop_start",
+            attempts=len(_TICKET_RETRY_DELAYS),
+        )
         for attempt, delay in enumerate(_TICKET_RETRY_DELAYS):
             if delay:
+                _log_stage(
+                    conn, "jssdk_ticket", "retry", level="WARNING",
+                    attempt=attempt + 1, retry_in_s=delay,
+                )
                 await asyncio.sleep(delay)
             if time.monotonic() > deadline:
-                break
-            try:
-                return await request_ticket_via_jssdk(
-                    auth_str, DESKCLAWBOT_SDK_API_KEY, logger_=logger
+                _log_stage(
+                    conn, "jssdk_ticket", "deadline", level="WARNING",
+                    attempt=attempt + 1, elapsed_ms=_elapsed_ms(started),
                 )
+                break
+            attempt_started = time.monotonic()
+            _log_stage(
+                conn, "jssdk_ticket", "attempt_start",
+                attempt=attempt + 1, total=len(_TICKET_RETRY_DELAYS),
+            )
+            try:
+                ticket = await request_ticket_via_jssdk(
+                    auth_str, DESKCLAWBOT_SDK_API_KEY, logger_=logger, conn=conn
+                )
+                _log_stage(
+                    conn, "jssdk_ticket", "ok", attempt=attempt + 1,
+                    ticket_len=len(ticket), elapsed_ms=_elapsed_ms(attempt_started),
+                )
+                return ticket
             except CtcloudProvisioningError as e:
                 if not e.retryable:
+                    _log_stage(
+                        conn, "jssdk_ticket", "fail", level="WARNING",
+                        attempt=attempt + 1, code=e.code, retryable=False,
+                        elapsed_ms=_elapsed_ms(attempt_started),
+                    )
                     raise
                 last_error = e
-                logger.warning("ctcloud ticket attempt {}/{} failed: {}", attempt + 1, len(_TICKET_RETRY_DELAYS), e)
+                _log_stage(
+                    conn, "jssdk_ticket", "fail", level="WARNING",
+                    attempt=attempt + 1, code=e.code, retryable=True,
+                    elapsed_ms=_elapsed_ms(attempt_started),
+                )
+        _log_stage(
+            conn, "jssdk_ticket", "fail", level="WARNING",
+            code="ticket-exhausted", attempts=len(_TICKET_RETRY_DELAYS),
+            elapsed_ms=_elapsed_ms(started),
+        )
         raise CtcloudProvisioningError(
             "ticket-exhausted", f"取票重试耗尽（{len(_TICKET_RETRY_DELAYS)} 次）：{last_error}"
         )
@@ -882,17 +1337,57 @@ class CtcloudChannel(BaseChannel):
 
     async def start(self) -> None:
         """凭证装载 → 缺凭证则自动注册 → gRPC 收流。"""
+        conn = _new_conn_id()
+        self._conn_id = conn
+        started = time.monotonic()
+        _log_stage(
+            conn, "preflight", "start",
+            enabled=self.config.enabled,
+            grpc_available=CTCLOUD_AVAILABLE,
+            allow_from_count=len(ALLOW_FROM),
+            datasource=LINUX_DATASOURCE_PATH,
+        )
+        try:
+            await self._start_once(conn, started)
+        except asyncio.CancelledError:
+            _log_stage(
+                conn, "lifecycle", "cancelled", level="WARNING",
+                elapsed_ms=_elapsed_ms(started),
+            )
+            raise
+        except Exception as e:
+            _log_stage(
+                conn, "lifecycle", "fail", level="ERROR",
+                code=getattr(e, "code", "unexpected"),
+                exc=type(e).__name__,
+                detail=str(e)[:300],
+                elapsed_ms=_elapsed_ms(started),
+            )
+            logger.exception("ctcloud startup failed (conn={})", conn)
+            raise
+
+    async def _start_once(self, conn: str, started: float) -> None:
         if not CTCLOUD_AVAILABLE:
+            _log_stage(
+                conn, "preflight", "fail", level="WARNING",
+                code="grpc-unavailable", detail="grpcio not installed",
+            )
             self.set_setup_state(
                 "unavailable",
                 message="缺少 grpcio 依赖（pip install grpcio），渠道无法启动。",
             )
             return
         if not self.config.enabled:
+            _log_stage(
+                conn, "preflight", "fail", level="WARNING", code="disabled",
+            )
             self.set_setup_state("action_required", message="渠道未启用（enabled=false）。")
             return
         if not ALLOW_FROM:
             logger.warning("ctcloud: ALLOW_FROM is empty — all access denied")
+            _log_stage(
+                conn, "preflight", "warn", level="WARNING", code="allow-from-empty",
+            )
 
         self._running = True
         self._loop = asyncio.get_running_loop()
@@ -902,23 +1397,31 @@ class CtcloudChannel(BaseChannel):
         try:
             self._desktop_uuid = read_desktop_uuid()
         except CtcloudError as e:
+            _log_stage(
+                conn, "preflight", "fail", level="WARNING",
+                code=e.code, detail=str(e)[:300],
+            )
             self.set_setup_state("action_required", message=str(e))
             self._running = False
             return
+        _log_stage(
+            conn, "preflight", "ok",
+            desktop_uuid_present=bool(self._desktop_uuid),
+            desktop_uuid_len=len(self._desktop_uuid),
+        )
 
-        creds = self._load_credentials()
-        if creds is not None:
-            logger.info(
-                "ctcloud loaded cached credentials from {}: account_id={} auth_exp={}",
-                self._state_path(), creds.claw_bot_account_id,
-                _jwt_exp(creds.yl_authorization),
-            )
+        creds = self._load_credentials(conn)
         if creds is None:
             self.set_setup_state("connecting", message="未发现凭证，正在发起注册编排…")
             try:
-                creds = await self._provision()
+                creds = await self._provision(conn)
                 self._save_credentials(creds)
             except CtcloudError as e:
+                _log_stage(
+                    conn, "provision", "fail", level="ERROR",
+                    code=e.code, detail=str(e)[:300],
+                    elapsed_ms=_elapsed_ms(started),
+                )
                 self.set_setup_state(
                     "action_required",
                     message=f"注册编排失败（{e.code}）：{e}。请确认云电脑客户端已启动并登录。",
@@ -928,15 +1431,29 @@ class CtcloudChannel(BaseChannel):
         self._credentials = creds
         self.set_setup_state("connecting", message="正在建立 gRPC 长连接…")
 
-        await self._connect_grpc()
-        self._recv_task = asyncio.create_task(self._recv_loop())
+        await self._connect_grpc(conn)
+        self._recv_task = asyncio.create_task(self._recv_loop(conn))
         self.set_setup_state("running")
+        _log_stage(
+            conn, "lifecycle", "running",
+            account_id=creds.claw_bot_account_id,
+            elapsed_ms=_elapsed_ms(started),
+        )
 
         while self._running:
             await asyncio.sleep(1)
 
     async def stop(self) -> None:
         """取消收流 task、关闭 gRPC channel / TLS 隧道与 HTTP 客户端。"""
+        conn = self._conn_id or "-"
+        started = time.monotonic()
+        _log_stage(
+            conn, "lifecycle", "stop_start",
+            recv_task_running=bool(self._recv_task and not self._recv_task.done()),
+            pending_sends=len(self._pending_sends),
+            tunnel=self._tunnel is not None,
+            grpc_channel=self._grpc_channel is not None,
+        )
         self._running = False
         task = self._recv_task
         if task is not None and not task.done():
@@ -957,6 +1474,9 @@ class CtcloudChannel(BaseChannel):
             await self._http.aclose()
             self._http = None
         self._pending_sends.clear()
+        _log_stage(
+            conn, "lifecycle", "stop_ok", elapsed_ms=_elapsed_ms(started),
+        )
         logger.info("ctcloud channel stopped")
 
     # ── 出站发送 ──────────────────────────────────────────────────
@@ -1128,7 +1648,7 @@ class CtcloudChannel(BaseChannel):
             ) from e
         return useragent_chat_pb2, useragent_chat_pb2_grpc
 
-    async def _connect_grpc(self) -> None:
+    async def _connect_grpc(self, conn: str = "-", *, reconnect: bool = False) -> None:
         pb2, pb2_grpc = self._load_stub()
         address = DEFAULT_GRPC_SERVER_ADDRESS
         # 网关是 TLS 服务（自签 CA）且**不回 ALPN**：grpc C-core 的
@@ -1139,8 +1659,19 @@ class CtcloudChannel(BaseChannel):
         # gRPC 用 insecure_channel 连本地端口。
         target = address.removeprefix("https://").removeprefix("http://")
         ca_path = Path(__file__).parent / "yilian_ca.crt"
+        # 首次建联完整记录；重连的传输层细节降为 DEBUG，避免 5s 循环刷屏。
+        level = "DEBUG" if reconnect else "INFO"
+        started = time.monotonic()
+        _log_stage(
+            conn, "transport.grpc", "start", level=level,
+            target=target, ca=("present" if ca_path.is_file() else "none"),
+            reconnect=reconnect,
+        )
         self._tunnel = await _TlsTunnel.start(
-            target, ca_path if ca_path.is_file() else None
+            target,
+            ca_path if ca_path.is_file() else None,
+            conn=conn,
+            log_level=level,
         )
         # 隧道方案下 gRPC 的连接目标是 127.0.0.1:<port>，HTTP/2 :authority
         # 伪头会默认取该值——接入层按 :authority 路由/鉴权，必须显式改写为
@@ -1149,13 +1680,14 @@ class CtcloudChannel(BaseChannel):
             f"127.0.0.1:{self._tunnel.local_port}",
             options=[("grpc.default_authority", target)],
         )
-        logger.info(
-            "ctcloud grpc channel opened: target={} via local TLS tunnel {}",
-            target, self._tunnel.local_port,
-        )
         self._grpc_stub = pb2_grpc.UserAgentChatServiceStub(self._grpc_channel)
+        _log_stage(
+            conn, "transport.grpc", "ok", level=level,
+            authority=target, local_port=self._tunnel.local_port,
+            mode="insecure-via-tunnel", elapsed_ms=_elapsed_ms(started),
+        )
 
-    async def _recv_loop(self) -> None:
+    async def _recv_loop(self, conn: str = "-") -> None:
         """connect() 收流主循环：断线重连 + 事件分发。
 
         PERMISSION_DENIED（RBAC: access denied）按参考实装归类为不可自愈：
@@ -1165,37 +1697,84 @@ class CtcloudChannel(BaseChannel):
         pb2, _ = self._load_stub()
         creds = self._credentials
         assert creds is not None
+        attempt = 0
+        error_streak = 0
+        last_error_code = ""
         while self._running:
+            attempt += 1
+            started = time.monotonic()
+            # 首次建联完整记录；持续重连时降频，避免 5s 循环刷屏。
+            connect_level = (
+                "INFO" if (attempt <= 3 or attempt % 10 == 0) else "DEBUG"
+            )
+            _log_stage(
+                conn, "stream.connect", "start", level=connect_level, attempt=attempt
+            )
+            first_event = True
             try:
                 call = self._grpc_stub.connect(
                     pb2.ConnectRequest(), metadata=self._grpc_auth_metadata(creds)
                 )
+                _log_stage(
+                    conn, "stream.connect", "open", level=connect_level,
+                    attempt=attempt, elapsed_ms=_elapsed_ms(started),
+                )
                 async for event in call:
+                    if first_event:
+                        first_event = False
+                        _log_stage(
+                            conn, "stream.connect", "established",
+                            attempt=attempt, elapsed_ms=_elapsed_ms(started),
+                        )
                     await self._dispatch_event(event)
+                _log_stage(
+                    conn, "stream.connect", "end", attempt=attempt,
+                    uptime_ms=_elapsed_ms(started),
+                )
             except asyncio.CancelledError:
+                _log_stage(
+                    conn, "stream.connect", "cancelled", attempt=attempt,
+                    uptime_ms=_elapsed_ms(started),
+                )
                 return
             except Exception as e:
                 if not self._running:
                     return
+                grpc_code = _grpc_error_code(e)
                 if (
                     GRPC_AVAILABLE
                     and isinstance(e, grpc.aio.AioRpcError)
                     and e.code() == grpc.StatusCode.PERMISSION_DENIED
                 ):
                     self._running = False
-                    self._log_grpc_denied(e, creds)
+                    self._log_grpc_denied(conn, e, creds, attempt=attempt)
                     self.set_setup_state(
                         "action_required",
                         message="RBAC 鉴权被拒绝（PERMISSION_DENIED）：机器人未被授权或桌面绑定不符，"
                         "请在云台侧开通权限后重新启动渠道；密钥/授权无效时需删除凭证重新接入。",
                     )
-                    logger.error("ctcloud grpc PERMISSION_DENIED — 机器人未被授权，停止重连")
+                    logger.error(
+                        "ctcloud grpc PERMISSION_DENIED — 机器人未被授权，停止重连 (conn={})",
+                        conn,
+                    )
                     return
-                logger.warning(
-                    "ctcloud grpc stream error: code={} details={} debug_error_string={} — reconnecting in 5s",
-                    getattr(e, "code", lambda: "")(),
-                    getattr(e, "details", lambda: "")(),
-                    getattr(e, "debug_error_string", lambda: "")(),
+                error_streak = (
+                    error_streak + 1 if grpc_code == last_error_code else 1
+                )
+                last_error_code = grpc_code
+                # 持续同一错误时降频：前 3 次逐条，之后每 10 次一条。
+                level = (
+                    "WARNING"
+                    if (error_streak <= 3 or error_streak % 10 == 0)
+                    else "DEBUG"
+                )
+                _log_stage(
+                    conn, "stream.reconnect", "fail", level=level,
+                    attempt=attempt, code=grpc_code or "unknown",
+                    details=_grpc_error_field(e, "details"),
+                    debug_error_string=_grpc_error_field(e, "debug_error_string"),
+                    uptime_ms=_elapsed_ms(started), retry_in_s=5,
+                    streak=error_streak,
                 )
                 await asyncio.sleep(5)
                 # 先停旧隧道再建新隧道，避免每次重连泄漏一个本地监听
@@ -1205,20 +1784,23 @@ class CtcloudChannel(BaseChannel):
                 if self._grpc_channel is not None:
                     await self._grpc_channel.close()
                     self._grpc_channel = None
-                await self._connect_grpc()
+                await self._connect_grpc(conn, reconnect=True)
 
-    def _log_grpc_denied(self, e: Any, creds: _Credentials) -> None:
+    def _log_grpc_denied(
+        self, conn: str, e: Any, creds: _Credentials, *, attempt: int = 0
+    ) -> None:
         """PERMISSION_DENIED 排查日志（供平台后端定位，凭据只输出脱敏形态）。"""
-        logger.error(
-            "ctcloud grpc PERMISSION_DENIED: details={!r} debug_error_string={!r} "
-            "device_id={} desktop_uuid={} sk_fingerprint={} auth_len={} auth_exp={}",
-            getattr(e, "details", lambda: "")(),
-            getattr(e, "debug_error_string", lambda: "")(),
-            creds.claw_bot_account_id,
-            self._desktop_uuid,
-            _credential_fingerprint(creds.sign_key),
-            len(creds.yl_authorization),
-            _jwt_exp(creds.yl_authorization),
+        _log_stage(
+            conn, "stream.denied", "terminal", level="ERROR",
+            attempt=attempt,
+            details=_grpc_error_field(e, "details"),
+            debug_error_string=_grpc_error_field(e, "debug_error_string"),
+            device_id=creds.claw_bot_account_id,
+            desktop_uuid=self._desktop_uuid,
+            sk_fp=_credential_fingerprint(creds.sign_key),
+            auth_len=len(creds.yl_authorization),
+            auth_exp=_jwt_exp(creds.yl_authorization),
+            hint="RBAC 未授权或桌面绑定不符；需云台开通权限或删除凭证重新接入",
         )
 
     async def _dispatch_event(self, event: Any) -> None:
